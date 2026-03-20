@@ -166,18 +166,12 @@ def build_report(csv_path, output_path):
         "run on SM120. FA4 is SM100-only. We found this out the hard way when our first benchmark "
         "script crashed immediately.", body))
     story.append(Paragraph(
-        "This is probably a common experience for students and hobbyists who buy consumer GPUs "
-        "expecting them to work for both gaming and ML. There is not much published data on what "
-        "attention kernels actually work on SM120 or how fast they are, so we decided to find out. "
-        "The goal is simple: test every attention kernel we can get running on the RTX 5060, measure "
-        "throughput, and compare against published FA3 numbers on the H100 to quantify the gap.", body))
-    story.append(Paragraph(
-        "For background: attention's O(N<super>2</super>) cost has driven a series of increasingly "
-        "specialized kernels. FlashAttention [1] introduced IO-aware tiling for Ampere, FA2 [2] "
-        "improved occupancy and warp specialization, FA3 [3] added Hopper-specific WGMMA and TMA "
-        "support, and FA4 [4] targets SM100 with tcgen05/UMMA. Each generation is more tightly "
-        "coupled to specific hardware, which is great for datacenter users but leaves consumer "
-        "GPUs behind.", body))
+        "This is probably a common experience. There is not much published data on what attention "
+        "kernels work on SM120, so we decided to find out: test every kernel we can get running, "
+        "measure throughput, and compare against FA3 on H100. For context, attention's "
+        "O(N<super>2</super>) cost has driven increasingly specialized kernels — FlashAttention [1] "
+        "for Ampere, FA2 [2] with better occupancy, FA3 [3] with Hopper WGMMA/TMA, FA4 [4] for "
+        "SM100 — each more tightly coupled to specific hardware.", body))
 
     # ══════════ 2. Background ══════════
 
@@ -214,14 +208,24 @@ def build_report(csv_path, output_path):
         "All experiments run on an RTX 5060 Laptop GPU (SM120, 8 GB GDDR7) under Windows 11 "
         "with WSL2. Software: PyTorch 2.7.0+cu128 nightly (stable does not support SM120), "
         "Triton 3.6.0, FA2 v2.7.4.post1 (Zarrac community wheel — the official one segfaults "
-        "on SM120), SageAttention 1.0.6 from PyPI. Config: 32 heads, d=128, BF16, causal mask. "
-        "Sequence lengths 512-8192, batch sizes 1 and 8. Each config gets 10 warmup + 100 timed "
-        "iterations using torch.cuda.Event. TFLOPs/s = "
-        "4 x B x H x S<super>2</super> x D / time / 10<super>12</super>. "
-        "Reference: FA3 on H100 at 740 (FP16) and 840 (BF16) TFLOPs/s [3].", body))
+        "on SM120), SageAttention 1.0.6 from PyPI.", body))
+    story.append(Paragraph(
+        "We use a config that matches a typical LLM attention layer: H = 32 attention heads, "
+        "each with head dimension d = 128 (so the total hidden dimension is 32 x 128 = 4096, "
+        "same as LLaMA-7B). All inputs are BF16 with causal masking enabled. We sweep sequence "
+        "length S across {512, 1024, 2048, 4096, 8192} and batch size B across {1, 8}. "
+        "B = 1 simulates single-request inference latency; B = 8 tests throughput under batching, "
+        "which also stresses the 8 GB VRAM limit. Each config gets 10 warmup iterations "
+        "(to let Triton JIT compile and caches warm up) followed by 100 timed iterations "
+        "using torch.cuda.Event for GPU-side timing that excludes CPU overhead.", body))
+    story.append(Paragraph(
+        "Throughput is reported as TFLOPs/s = "
+        "4 x B x H x S<super>2</super> x d / t / 10<super>12</super>, where t is wall time "
+        "in seconds. The factor of 4 counts both the QK<super>T</super> and score-V matmuls "
+        "(2 x S<super>2</super> x d FLOPs each, multiply + accumulate). Reference: published "
+        "FA3 on H100 SXM at 740 (FP16) and 840 (BF16) TFLOPs/s [3].", body))
 
     # ══════════ 4. Results ══════════
-    story.append(PageBreak())
 
     story.append(Paragraph("4. Results", h1))
 
@@ -297,7 +301,6 @@ def build_report(csv_path, output_path):
         "GDDR7 card, based on the 5060's 168-bit bus at 28 Gbps), the software gap is real too.", body))
 
     # Gap summary table
-    story.append(PageBreak())
     story.append(Paragraph("4.2 Gap vs. Datacenter", h2))
     gap_data = [
         ["Kernel", "Peak TF/s", "vs FA3 FP16 (740)", "vs FA3 BF16 (840)"],
@@ -327,34 +330,20 @@ def build_report(csv_path, output_path):
         "The H100 also just has more raw compute: 989 TFLOPS BF16 peak, which our laptop GPU "
         "does not come close to.", body))
 
-    story.append(Paragraph("5.2 Comparison with Published SageAttention Results", h2))
+    story.append(Paragraph("5.2 SageAttention vs. FA2: Our Results vs. the Paper", h2))
     story.append(Paragraph(
-        "One thing we wanted to check was whether the SageAttention-over-FA2 speedup we measured "
-        "lines up with what the original paper reports. The SageAttention v1 paper [5] shows about "
-        "2x average speedup over FA2 on the RTX 4090 (SM89), peaking at 341 TOPS vs. FA2's 165 TOPS. "
-        "We only see 1.4-1.7x on SM120, which is noticeably lower.", body))
-    story.append(Paragraph(
-        "We think this difference is mostly a software maturity issue, not an algorithmic one. The "
-        "INT8 quantization trick in SageAttention should give roughly the same benefit regardless of "
-        "hardware — halving the bandwidth for the QK matmul is halving the bandwidth. But the "
-        "version we are running (1.0.6 from PyPI) uses Triton-generated kernels, not the hand-tuned "
-        "CUDA kernels that were benchmarked in the paper. Triton's SM120 code generation only "
-        "landed in version 3.6 and is probably not as mature as its SM89 path. SageAttention 2.0 "
-        "claims ~3x over FA2 on the 4090 with 4-bit quantization; on SM120 we would expect the "
-        "ratio to be similarly lower until someone builds native CUDA kernels for this chip.", body))
+        "The SageAttention v1 paper [5] reports ~2x speedup over FA2 on the RTX 4090 (SM89). We "
+        "only see 1.4-1.7x on SM120. The INT8 quantization benefit should be roughly "
+        "hardware-agnostic — halving QK bandwidth is halving QK bandwidth — so the shortfall is "
+        "likely a software maturity issue. We are running Triton 3.6 JIT kernels, not the hand-tuned "
+        "CUDA kernels benchmarked in the paper, and Triton's SM120 codegen only shipped recently. "
+        "It is worth noting that FA2's CUDA kernels target SM80 and cannot issue SM120 tensor core "
+        "instructions at all, while SageAttention's Triton kernels actually compile for SM120 natively. "
+        "So Triton JIT beats hand-written CUDA here simply because it targets the right hardware. "
+        "SageAttention 2.0 claims ~3x over FA2 on the 4090 with 4-bit quantization; we would expect "
+        "a similarly attenuated ratio on SM120 until native CUDA kernels exist.", body))
 
-    story.append(Paragraph("5.3 Why SageAttention Beats FA2 Here", h2))
-    story.append(Paragraph(
-        "It is a bit surprising that a Triton-JIT kernel beats FlashAttention-2, which is "
-        "hand-written CUDA. But the explanation is simple once you think about it: FA2's CUDA "
-        "kernels were compiled for SM80 and cannot issue SM120 tensor core instructions at all. "
-        "SageAttention's Triton kernels get JIT-compiled by Triton 3.6, which actually has an "
-        "SM120 backend. So even though Triton-generated code is generally less optimized than "
-        "hand-tuned CUDA, it wins here because it is at least targeting the right hardware. "
-        "On top of that, the INT8 QK matmul uses half the bandwidth of FA2's BF16 path, which "
-        "helps a lot on a bandwidth-constrained card.", body))
-
-    story.append(Paragraph("5.4 Practical Takeaways", h2))
+    story.append(Paragraph("5.3 Practical Takeaways for Consumer GPU Users", h2))
     story.append(Paragraph(
         "If you have an RTX 50-series and want to run attention workloads, use SageAttention. "
         "It is about 1.7x faster than FA2 at longer sequences. That said, even with SageAttention, "
@@ -364,37 +353,35 @@ def build_report(csv_path, output_path):
         "before hitting the 8 GB VRAM wall, which is enough for experimentation and coursework "
         "but not for anything resembling production inference.", body))
 
-    story.append(Paragraph("5.5 Limitations and Future Work", h2))
+    story.append(Paragraph("5.4 Limitations and Future Work", h2))
     story.append(Paragraph(
-        "There are a few things we did not get to. We ran SageAttention 1.0.6 (the Triton version), "
-        "not v2.2 which has native CUDA kernels — building that from source with the right CUDA "
-        "toolkit turned out to be more setup than we had time for, and would be a good follow-up. "
-        "We also only tested causal attention with d=128; GQA or non-causal attention might shift "
-        "the relative numbers. Our RTX 5060 is a laptop variant, so a desktop 5060 might clock "
-        "higher and show slightly different results. A roofline analysis would help separate how "
-        "much of the gap is bandwidth-bound vs. compute-bound. And Triton's SM120 codegen will "
-        "presumably get better — it would be worth re-running these benchmarks in six months.", body))
+        "We ran SageAttention 1.0.6 (Triton), not v2.2 with native CUDA kernels — building that "
+        "from source was more setup than we had time for. We only tested causal attention with "
+        "d=128; GQA may shift the numbers. Our laptop 5060 may clock lower than desktop variants. "
+        "A roofline analysis would help quantify bandwidth-bound vs. compute-bound phases. "
+        "Re-running in six months as Triton's SM120 codegen matures would be worthwhile.", body))
 
     # ══════════ 6. Conclusion + References ══════════
 
     story.append(Paragraph("6. Conclusion", h1))
     story.append(Paragraph(
-        "We set out to answer a simple question — can a consumer Blackwell GPU run attention "
-        "kernels, and if so, how fast? The answer: yes, but with caveats. SageAttention hits "
-        "110 TFLOPs/s, FA2 hits 65, and the SDPA math backend is essentially unusable at "
-        "2.5 TFLOPs/s before it OOMs. The gap to FA3 on an H100 (840 TFLOPs/s BF16) is 7-13x, "
-        "driven by both hardware differences (the 10x bandwidth gap) and software immaturity "
-        "(everything running in compatibility mode or through immature JIT paths).", body))
-    story.append(Paragraph(
-        "The SageAttention speedup we measured (1.4-1.7x over FA2) is lower than the 2x reported "
-        "in the original paper on RTX 4090, which we attribute to Triton's relatively new SM120 "
-        "backend rather than anything algorithmic. This will probably improve as the tooling "
-        "matures. For now, if you are a student or hobbyist with a consumer Blackwell GPU and "
-        "you want to run attention workloads, SageAttention is the way to go. Just know that "
-        "you are leaving about an order of magnitude of performance on the table compared to "
-        "datacenter hardware — and most of that is physics (bandwidth), not software.", body))
+        "Can a consumer Blackwell GPU run attention kernels? Yes, but with caveats. SageAttention "
+        "hits 110 TFLOPs/s, FA2 hits 65, and the SDPA math backend is unusable at 2.5 TFLOPs/s "
+        "before OOMing. The 7-13x gap to FA3 on H100 comes from both hardware (10x bandwidth gap) "
+        "and software (SM80 compat mode, immature Triton codegen). Our 1.4-1.7x SageAttention-over-FA2 "
+        "speedup is lower than the paper's 2x on RTX 4090, which we attribute to the young SM120 "
+        "toolchain rather than anything algorithmic. For students and hobbyists with consumer Blackwell "
+        "hardware, SageAttention is the clear choice today — just expect an order-of-magnitude gap "
+        "versus datacenter, mostly from physics (bandwidth) rather than software.", body))
 
     story.append(Spacer(1, 6))
+    story.append(Paragraph("Code Availability", h1))
+    story.append(Paragraph(
+        "All benchmark scripts, results, and plotting code are available at "
+        "<link href='https://github.com/shantanu-exe/sm120-attention-bench'>"
+        "github.com/shantanu-exe/sm120-attention-bench</link>.", body))
+
+    story.append(Spacer(1, 4))
     story.append(Paragraph("Acknowledgements", h1))
     story.append(Paragraph(
         "We owe a lot to Zarrac on GitHub for maintaining the SM120-compatible FA2 wheel — "
@@ -431,6 +418,6 @@ def build_report(csv_path, output_path):
 if __name__ == "__main__":
     base = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base, "results.csv")
-    out_path = os.path.join(base, "report", "cse240b_report_v6.pdf")
+    out_path = os.path.join(base, "report", "cse240b_report_v8.pdf")
     os.makedirs(os.path.join(base, "report"), exist_ok=True)
     build_report(csv_path, out_path)
