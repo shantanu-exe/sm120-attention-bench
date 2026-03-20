@@ -318,17 +318,62 @@ def build_report(csv_path, output_path):
 
     story.append(Paragraph("5. Analysis", h1))
 
-    story.append(Paragraph("5.1 Sources of the Performance Gap", h2))
+    story.append(Paragraph("5.1 Roofline Analysis", h2))
     story.append(Paragraph(
-        "The 7-13x gap is not one thing — it is several problems stacked on top of each other. "
-        "The most obvious is memory bandwidth: the H100 SXM has 3.35 TB/s of HBM3, while the "
-        "RTX 5060 has roughly 336 GB/s of GDDR7 (168-bit bus, 28 Gbps). That alone is about a "
-        "10x difference, and attention is heavily memory-bound at the sequence lengths we tested. "
-        "On top of that, FA2 on SM120 runs SM80-targeted code — it literally cannot issue SM120 "
-        "tensor core instructions. And the instructions that make FA3 fast on Hopper (WGMMA for "
-        "warp-group matmuls, TMA for async data movement) do not exist in the same form on SM120. "
-        "The H100 also just has more raw compute: 989 TFLOPS BF16 peak, which our laptop GPU "
-        "does not come close to.", body))
+        "To understand where the bottleneck actually lies, we performed a roofline analysis. "
+        "A roofline model plots a workload's achievable throughput (in TFLOPs/s) against its "
+        "operational intensity (OI) — the ratio of compute work to memory traffic, measured "
+        "in FLOPs per byte moved from main memory (HBM/GDDR). The model defines two ceilings: "
+        "the memory bandwidth ceiling (throughput limited by how fast data can be fetched) and "
+        "the compute ceiling (limited by how fast the GPU can execute arithmetic). The crossover "
+        "point, called the <i>ridge point</i>, tells you which ceiling applies: workloads with "
+        "OI below the ridge point are memory-bound; above it, compute-bound.", body))
+    story.append(Paragraph(
+        "For the RTX 5060 Laptop GPU, we use: peak memory bandwidth = 336 GB/s "
+        "(168-bit GDDR7 bus at 28 Gbps per pin), and estimated peak BF16 tensor core throughput "
+        "= 127 TFLOPS (36 SMs at roughly 3.5 TFLOPS/SM). This gives a ridge point of about "
+        "378 FLOPs/byte.", body))
+
+    # Embed roofline figure
+    roofline_png = os.path.join(tempfile.gettempdir(), "roofline.png")
+    # Copy roofline from figures/ to temp if it exists, else generate
+    import shutil
+    src_roofline = os.path.join(os.path.dirname(csv_path), "figures", "roofline.png")
+    if os.path.exists(src_roofline):
+        shutil.copy(src_roofline, roofline_png)
+    roofline_img = Image(roofline_png, width=6.3*inch, height=3.6*inch)
+    story.append(roofline_img)
+    story.append(Paragraph(
+        "<b>Figure 3.</b> Roofline analysis. The black line is the theoretical throughput "
+        "ceiling — the sloped portion is memory-bandwidth limited, the flat portion is "
+        "compute limited. The dotted vertical line marks the ridge point (378 FLOPs/byte). "
+        "Points to the right of the ridge are theoretically compute-bound.", cap))
+
+    # Roofline utilization table
+    roof_data = [
+        ["Kernel", "Peak TF/s", "% of 127 TF Peak", "Bottleneck"],
+        ["SDPA math", "2.5", "2%", "Memory (materializes S*S)"],
+        ["FlashAttn-2", "65.6", "52%", "Compute (SM80 compat mode)"],
+        ["SageAttention", "110.2", "87%", "Compute (native SM120 JIT)"],
+    ]
+    rooft = Table(roof_data, colWidths=[1.1*inch, 0.9*inch, 1.3*inch, 2.1*inch])
+    rooft.setStyle(tbl_style)
+    story.append(rooft)
+    story.append(Paragraph(
+        "<b>Table 4.</b> Compute utilization from roofline analysis. "
+        "% of peak = measured TFLOPs/s divided by estimated 127 TFLOPS BF16 peak.", cap))
+
+    story.append(Paragraph(
+        "The results were not what we initially expected. With the minimum-IO operational "
+        "intensity (counting Q, K, V read once and O written once), all FA2 and SageAttention "
+        "configs land well to the right of the ridge point — meaning attention at these sequence "
+        "lengths is <i>compute-bound</i>, not memory-bound. The 10x bandwidth gap between "
+        "the H100 and the RTX 5060 matters less than we thought. The real bottleneck is "
+        "<i>compute utilization</i>: FA2 hits only 52% of peak because it runs SM80 code that "
+        "cannot issue SM120 tensor core instructions. SageAttention reaches 87% by targeting "
+        "SM120 natively through Triton's JIT compiler. SDPA math is the exception at 2% — it "
+        "materializes the full attention matrix, which pushes its OI down into the memory-bound "
+        "region and wastes bandwidth on unnecessary reads and writes.", body))
 
     story.append(Paragraph("5.2 SageAttention vs. FA2: Our Results vs. the Paper", h2))
     story.append(Paragraph(
@@ -358,21 +403,23 @@ def build_report(csv_path, output_path):
         "We ran SageAttention 1.0.6 (Triton), not v2.2 with native CUDA kernels — building that "
         "from source was more setup than we had time for. We only tested causal attention with "
         "d=128; GQA may shift the numbers. Our laptop 5060 may clock lower than desktop variants. "
-        "A roofline analysis would help quantify bandwidth-bound vs. compute-bound phases. "
-        "Re-running in six months as Triton's SM120 codegen matures would be worthwhile.", body))
+        "The peak BF16 TFLOPS estimate (127) is approximate; exact specs are not published for "
+        "this laptop SKU. Re-running in six months as Triton's SM120 codegen matures would be "
+        "worthwhile.", body))
 
     # ══════════ 6. Conclusion + References ══════════
 
     story.append(Paragraph("6. Conclusion", h1))
     story.append(Paragraph(
         "Can a consumer Blackwell GPU run attention kernels? Yes, but with caveats. SageAttention "
-        "hits 110 TFLOPs/s, FA2 hits 65, and the SDPA math backend is unusable at 2.5 TFLOPs/s "
-        "before OOMing. The 7-13x gap to FA3 on H100 comes from both hardware (10x bandwidth gap) "
-        "and software (SM80 compat mode, immature Triton codegen). Our 1.4-1.7x SageAttention-over-FA2 "
+        "hits 110 TFLOPs/s (87% compute utilization), FA2 hits 65 (52%), and the SDPA math backend "
+        "is unusable at 2.5 TFLOPs/s. Our roofline analysis shows that attention on SM120 is "
+        "compute-bound, not memory-bound — the bottleneck is how well each kernel utilizes SM120's "
+        "tensor cores, not the GDDR7 bandwidth. FA2 loses because it runs SM80 instructions; "
+        "SageAttention wins because Triton 3.6 targets SM120 natively. The 1.4-1.7x SageAttention-over-FA2 "
         "speedup is lower than the paper's 2x on RTX 4090, which we attribute to the young SM120 "
-        "toolchain rather than anything algorithmic. For students and hobbyists with consumer Blackwell "
-        "hardware, SageAttention is the clear choice today — just expect an order-of-magnitude gap "
-        "versus datacenter, mostly from physics (bandwidth) rather than software.", body))
+        "toolchain. For students and hobbyists with consumer Blackwell hardware, SageAttention is "
+        "the clear choice — just expect an order-of-magnitude gap versus datacenter.", body))
 
     story.append(Spacer(1, 6))
     story.append(Paragraph("Code Availability", h1))
@@ -407,6 +454,8 @@ def build_report(csv_path, output_path):
         "[6] NVIDIA Corporation. NVIDIA Blackwell Architecture Technical Brief. 2024.",
         "[7] Tillet, P., Kung, H.T., and Cox, D. Triton: An Intermediate Language and Compiler "
         "for Tiled Neural Network Computations. MLSys, 2019.",
+        "[8] Williams, S., Waterman, A., and Patterson, D. Roofline: An Insightful Visual "
+        "Performance Model for Multicore Architectures. Communications of the ACM, 52(4), 2009.",
     ]
     for r in refs:
         story.append(Paragraph(r, refstyle))
@@ -418,6 +467,6 @@ def build_report(csv_path, output_path):
 if __name__ == "__main__":
     base = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base, "results.csv")
-    out_path = os.path.join(base, "report", "cse240b_report_v8.pdf")
+    out_path = os.path.join(base, "report", "cse240b_report_v9.pdf")
     os.makedirs(os.path.join(base, "report"), exist_ok=True)
     build_report(csv_path, out_path)
